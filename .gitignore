@@ -1,0 +1,7 @@
+node_modules/
+.env
+pessoas.json
+comprovante_*.png
+comprovante_*.pdf
+eng.traineddata
+package-lock.json

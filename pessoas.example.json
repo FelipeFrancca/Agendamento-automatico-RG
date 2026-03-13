@@ -1,0 +1,27 @@
+[
+	{
+		"nome": "NOME COMPLETO",
+		"idade": 25,
+		"cpf": "00000000000",
+		"rg": "000000000",
+		"data_nasc": "01/01/2000",
+		"sexo": "Masculino",
+		"signo": "Peixes",
+		"mae": "NOME DA MAE",
+		"pai": "NOME DO PAI",
+		"email": "exemplo@email.com",
+		"senha": "senha",
+		"cep": "00000000",
+		"endereco": "Rua Exemplo",
+		"numero": 123,
+		"bairro": "Bairro",
+		"cidade": "Cidade",
+		"estado": "RN",
+		"telefone_fixo": "8400000000",
+		"celular": "84900000000",
+		"altura": "1,70",
+		"peso": 70,
+		"tipo_sanguineo": "O+",
+		"cor": "parda"
+	}
+]
