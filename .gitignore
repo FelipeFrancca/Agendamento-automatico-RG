@@ -1,6 +1,7 @@
 node_modules/
 .env
 pessoas.json
+bot.log
 comprovante_*.png
 comprovante_*.pdf
 eng.traineddata

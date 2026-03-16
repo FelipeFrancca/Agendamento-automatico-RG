@@ -7,6 +7,32 @@ require('dotenv').config();
 const LOCALIDADE_ALVO = process.env.LOCALIDADE ? process.env.LOCALIDADE.toUpperCase() : null;
 const MAX_TENTATIVAS_VAGAS = Number(process.env.MAX_TENTATIVAS_VAGAS || 8);
 
+// ==========================================
+// LOGGING — reseta a cada inicialização
+// ==========================================
+const LOG_PATH = path.join(__dirname, 'bot.log');
+let _logStream = null;
+
+const _origLog = console.log.bind(console);
+console.log = (...args) => {
+  const ts = new Date().toLocaleTimeString('pt-BR', { hour12: false });
+  const msg = args.map(a => (typeof a === 'object' ? JSON.stringify(a) : String(a))).join(' ');
+  const linha = `[${ts}] ${msg}`;
+  _origLog(linha);
+  if (_logStream) _logStream.write(linha + '\n');
+};
+
+const _origError = console.error.bind(console);
+console.error = (...args) => {
+  const ts = new Date().toLocaleTimeString('pt-BR', { hour12: false });
+  const msg = args.map(a => (typeof a === 'object' ? JSON.stringify(a) : String(a))).join(' ');
+  const linha = `[${ts}] [ERRO] ${msg}`;
+  _origError(linha);
+  if (_logStream) _logStream.write(linha + '\n');
+};
+
+process.on('exit', () => { if (_logStream) _logStream.end(); });
+
 async function esperar(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
@@ -90,28 +116,72 @@ async function lerCaptcha(page) {
   return text.replace(/[^0-9]/g, '').trim();
 }
 
+// Captura snapshot de todas as unidades visíveis com quantidade de vagas
+async function capturarSnapshotVagas(page, localidadeFiltro) {
+  return page.evaluate((filtro) => {
+    const unidades = [];
+    const paragrafos = Array.from(document.querySelectorAll('p'));
+    const vistos = new Set();
+
+    for (const pt of paragrafos) {
+      const containerFlex = pt.parentElement;
+      if (!containerFlex) continue;
+
+      const outer = containerFlex.parentElement;
+      if (!outer || !outer.className.includes('sc-')) continue;
+
+      const chave = containerFlex.innerText.trim();
+      if (vistos.has(chave)) continue;
+      vistos.add(chave);
+
+      const ps = Array.from(containerFlex.querySelectorAll('p'));
+      const cidade = ps[0] ? ps[0].innerText.trim() : '?';
+      const data   = ps[1] ? ps[1].innerText.trim() : '?';
+      const span   = containerFlex.querySelector('span');
+      const vagas  = span ? parseInt(span.innerText.trim(), 10) : null;
+
+      if (filtro && !cidade.toUpperCase().includes(filtro)) continue;
+
+      unidades.push({ cidade, data, vagas });
+    }
+
+    return unidades;
+  }, localidadeFiltro || null);
+}
+
+// Backoff progressivo: 800ms, 1200ms, 1800ms, 2500ms, ... (cresce ~50% por tentativa até 8s)
+function calcularBackoff(tentativa) {
+  const base = 800;
+  const fator = 1.5;
+  const maximo = 8000;
+  return Math.min(base * Math.pow(fator, tentativa - 1), maximo);
+}
+
 async function submeterComRetry(page, nomeCurto, maxTentativas = 8) {
   for (let tentativa = 1; tentativa <= maxTentativas; tentativa++) {
+    const backoff = calcularBackoff(tentativa);
+
     const selecao = await selecionarDiaHorario(page, tentativa - 1);
     if (!selecao.ok) {
-      console.log(`[${nomeCurto}] ⚠️ Tentativa ${tentativa}/${maxTentativas}: sem dia/horário disponível no momento.`);
-      await esperar(700);
+      console.log(`[${nomeCurto}] ⚠️ Tentativa ${tentativa}/${maxTentativas}: sem dia/horário disponível. Aguardando ${backoff}ms...`);
+      await esperar(backoff);
       continue;
     }
 
-    await esperar(700);
+    await esperar(Math.min(backoff * 0.5, 1200));
 
     const captcha = await lerCaptcha(page);
     if (captcha.length < 4 || captcha.length > 6) {
-      console.log(`[${nomeCurto}] ⚠️ Tentativa ${tentativa}/${maxTentativas}: captcha inválido lido pelo OCR (${captcha || 'vazio'}).`);
+      console.log(`[${nomeCurto}] ⚠️ Tentativa ${tentativa}/${maxTentativas}: captcha inválido lido pelo OCR (${captcha || 'vazio'}). Aguardando ${backoff}ms...`);
       await refreshCaptcha(page);
+      await esperar(backoff);
       continue;
     }
 
     const inputCaptcha = await page.$('input[type="number"], input[placeholder*="Captcha"], input[name*="captcha"]');
     if (!inputCaptcha) {
-      console.log(`[${nomeCurto}] ⚠️ Campo de captcha não encontrado na tentativa ${tentativa}/${maxTentativas}.`);
-      await esperar(600);
+      console.log(`[${nomeCurto}] ⚠️ Campo de captcha não encontrado na tentativa ${tentativa}/${maxTentativas}. Aguardando ${backoff}ms...`);
+      await esperar(backoff);
       continue;
     }
 
@@ -122,12 +192,12 @@ async function submeterComRetry(page, nomeCurto, maxTentativas = 8) {
 
     const clicou = await clicarBotaoProsseguir(page);
     if (!clicou) {
-      console.log(`[${nomeCurto}] ⚠️ Botão de prosseguir não encontrado na tentativa ${tentativa}/${maxTentativas}.`);
-      await esperar(600);
+      console.log(`[${nomeCurto}] ⚠️ Botão de prosseguir não encontrado na tentativa ${tentativa}/${maxTentativas}. Aguardando ${backoff}ms...`);
+      await esperar(backoff);
       continue;
     }
 
-    console.log(`[${nomeCurto}] 🧠 Captcha ${captcha} enviado para o horário ${selecao.horario} (tentativa ${tentativa}/${maxTentativas}).`);
+    console.log(`[${nomeCurto}] 🧠 Captcha ${captcha} enviado para o horário ${selecao.horario} (tentativa ${tentativa}/${maxTentativas}, backoff ${backoff}ms).`);
 
     const responseVagas = await page.waitForResponse(
       response => response.url().includes('/api/vagas'),
@@ -140,17 +210,17 @@ async function submeterComRetry(page, nomeCurto, maxTentativas = 8) {
         return true;
       }
 
-      console.log(`[${nomeCurto}] ⚠️ Sem resposta clara da API na tentativa ${tentativa}/${maxTentativas}; tentando novamente.`);
+      console.log(`[${nomeCurto}] ⚠️ Sem resposta clara da API na tentativa ${tentativa}/${maxTentativas}. Aguardando ${backoff}ms...`);
       await refreshCaptcha(page);
-      await esperar(700);
+      await esperar(backoff);
       continue;
     }
 
     const status = responseVagas.status();
     if (status === 400) {
-      console.log(`[${nomeCurto}] ⚠️ ERRO 400 em /api/vagas na tentativa ${tentativa}/${maxTentativas}. Recarregando captcha e trocando horário...`);
+      console.log(`[${nomeCurto}] ⚠️ ERRO 400 em /api/vagas na tentativa ${tentativa}/${maxTentativas}. Aguardando ${backoff}ms antes de tentar outro horário...`);
       await refreshCaptcha(page);
-      await esperar(800);
+      await esperar(backoff);
       continue;
     }
 
@@ -161,9 +231,9 @@ async function submeterComRetry(page, nomeCurto, maxTentativas = 8) {
       }
     }
 
-    console.log(`[${nomeCurto}] ⚠️ API retornou status ${status} na tentativa ${tentativa}/${maxTentativas}; nova tentativa em seguida.`);
+    console.log(`[${nomeCurto}] ⚠️ API retornou status ${status} na tentativa ${tentativa}/${maxTentativas}. Aguardando ${backoff}ms...`);
     await refreshCaptcha(page);
-    await esperar(800);
+    await esperar(backoff);
   }
 
   return false;
@@ -189,6 +259,7 @@ async function agendarParaPessoa(dados) {
     const URL = 'https://agendamento.pci.rn.gov.br/public/agendamento';
     
     let found = false;
+    let snapshotLogado = false;
 
     while (!found) {
       try {
@@ -223,6 +294,19 @@ async function agendarParaPessoa(dados) {
         }, LOCALIDADE_ALVO);
 
         if (clicoUnidade) {
+          if (!snapshotLogado) {
+            snapshotLogado = true;
+            const snapshot = await capturarSnapshotVagas(page, LOCALIDADE_ALVO).catch(() => []);
+            if (snapshot.length > 0) {
+              console.log(`[${nomeCurto}] 📋 Snapshot de vagas no momento da detecção:`);
+              for (const u of snapshot) {
+                const qtd = Number.isFinite(u.vagas) ? u.vagas : 'N/A';
+                console.log(`[${nomeCurto}]   • ${u.cidade} — ${u.data} — ${qtd} vaga(s)`);
+              }
+            } else {
+              console.log(`[${nomeCurto}] 📋 Snapshot: nenhuma unidade capturada (página pode ter mudado).`);
+            }
+          }
           console.log(`[${nomeCurto}] ✅ VAGA ENCONTRADA EM ${LOCALIDADE_ALVO || 'QUALQUER UNIDADE'}!`);
           found = true;
           break;
@@ -324,6 +408,13 @@ async function agendarParaPessoa(dados) {
 // INICIALIZAÇÃO
 // ==========================================
 (async () => {
+  _logStream = fs.createWriteStream(LOG_PATH, { flags: 'w' });
+  console.log('='.repeat(60));
+  console.log(`Bot iniciado: ${new Date().toLocaleString('pt-BR')}`);
+  console.log(`Localidade: ${LOCALIDADE_ALVO || 'qualquer'}`);
+  console.log(`Máx. tentativas vagas: ${MAX_TENTATIVAS_VAGAS}`);
+  console.log('='.repeat(60));
+
   const pessoasPath = path.join(__dirname, 'pessoas.json');
   if (!fs.existsSync(pessoasPath)) {
     console.error('Arquivo pessoas.json não encontrado!');
