@@ -5,6 +5,169 @@ const path = require('path');
 require('dotenv').config();
 
 const LOCALIDADE_ALVO = process.env.LOCALIDADE ? process.env.LOCALIDADE.toUpperCase() : null;
+const MAX_TENTATIVAS_VAGAS = Number(process.env.MAX_TENTATIVAS_VAGAS || 8);
+
+async function esperar(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function clicarBotaoProsseguir(page) {
+  const buttons = await page.$$('button');
+  for (const btn of buttons) {
+    const txt = await page.evaluate(el => el.innerText.toLowerCase(), btn);
+    if (txt.includes('prosseguir') || txt.includes('avançar')) {
+      await btn.click();
+      return true;
+    }
+  }
+  return false;
+}
+
+async function refreshCaptcha(page) {
+  const ok = await page.evaluate(() => {
+    const botoes = Array.from(document.querySelectorAll('button, [role="button"], svg, i'));
+    const candidato = botoes.find(el => {
+      const txt = (el.innerText || '').toLowerCase();
+      const aria = (el.getAttribute('aria-label') || '').toLowerCase();
+      const title = (el.getAttribute('title') || '').toLowerCase();
+      return txt.includes('captcha') || aria.includes('captcha') || title.includes('captcha') ||
+             txt.includes('atualizar') || aria.includes('atualizar') || title.includes('atualizar') ||
+             txt.includes('refresh') || aria.includes('refresh') || title.includes('refresh');
+    });
+    if (!candidato) return false;
+    candidato.click();
+    return true;
+  });
+
+  if (ok) {
+    await esperar(700);
+  }
+}
+
+async function selecionarDiaHorario(page, tentativa) {
+  const selecao = await page.evaluate((tentativaAtual) => {
+    const dias = Array.from(document.querySelectorAll('button.MuiPickersDay-root:not(.Mui-disabled), .react-datepicker__day:not(.react-datepicker__day--disabled), td:not(.disabled)'));
+    const diasValidos = dias.filter(d => {
+      const parse = parseInt((d.innerText || '').trim(), 10);
+      return !isNaN(parse) && parse > 0 && parse <= 31;
+    });
+
+    if (diasValidos.length === 0) {
+      return { ok: false, motivo: 'sem_dia' };
+    }
+
+    const idxDia = tentativaAtual % diasValidos.length;
+    diasValidos[idxDia].click();
+
+    const horarios = Array.from(document.querySelectorAll('button:not([disabled]), li:not(.disabled)'))
+      .filter(el => el.innerText && el.innerText.includes(':') && /\d{2}:\d{2}/.test(el.innerText));
+
+    if (horarios.length === 0) {
+      return { ok: false, motivo: 'sem_horario' };
+    }
+
+    const idxHorario = tentativaAtual % horarios.length;
+    const horario = horarios[idxHorario].innerText.trim();
+    horarios[idxHorario].click();
+
+    return { ok: true, horario };
+  }, tentativa);
+
+  return selecao;
+}
+
+async function lerCaptcha(page) {
+  const canvasDataUrl = await page.evaluate(() => {
+    const canvas = document.querySelector('canvas');
+    return canvas ? canvas.toDataURL() : null;
+  });
+
+  if (!canvasDataUrl) return '';
+
+  const base64Data = canvasDataUrl.replace(/^data:image\/png;base64,/, '');
+  const buffer = Buffer.from(base64Data, 'base64');
+  const { data: { text } } = await Tesseract.recognize(buffer, 'eng');
+  return text.replace(/[^0-9]/g, '').trim();
+}
+
+async function submeterComRetry(page, nomeCurto, maxTentativas = 8) {
+  for (let tentativa = 1; tentativa <= maxTentativas; tentativa++) {
+    const selecao = await selecionarDiaHorario(page, tentativa - 1);
+    if (!selecao.ok) {
+      console.log(`[${nomeCurto}] ⚠️ Tentativa ${tentativa}/${maxTentativas}: sem dia/horário disponível no momento.`);
+      await esperar(700);
+      continue;
+    }
+
+    await esperar(700);
+
+    const captcha = await lerCaptcha(page);
+    if (captcha.length < 4 || captcha.length > 6) {
+      console.log(`[${nomeCurto}] ⚠️ Tentativa ${tentativa}/${maxTentativas}: captcha inválido lido pelo OCR (${captcha || 'vazio'}).`);
+      await refreshCaptcha(page);
+      continue;
+    }
+
+    const inputCaptcha = await page.$('input[type="number"], input[placeholder*="Captcha"], input[name*="captcha"]');
+    if (!inputCaptcha) {
+      console.log(`[${nomeCurto}] ⚠️ Campo de captcha não encontrado na tentativa ${tentativa}/${maxTentativas}.`);
+      await esperar(600);
+      continue;
+    }
+
+    await inputCaptcha.click({ clickCount: 3 });
+    await page.keyboard.press('Backspace');
+    await inputCaptcha.type(captcha, { delay: 60 });
+    await esperar(400);
+
+    const clicou = await clicarBotaoProsseguir(page);
+    if (!clicou) {
+      console.log(`[${nomeCurto}] ⚠️ Botão de prosseguir não encontrado na tentativa ${tentativa}/${maxTentativas}.`);
+      await esperar(600);
+      continue;
+    }
+
+    console.log(`[${nomeCurto}] 🧠 Captcha ${captcha} enviado para o horário ${selecao.horario} (tentativa ${tentativa}/${maxTentativas}).`);
+
+    const responseVagas = await page.waitForResponse(
+      response => response.url().includes('/api/vagas'),
+      { timeout: 10000 }
+    ).catch(() => null);
+
+    if (!responseVagas) {
+      const abriuFormulario = await page.waitForSelector('input#nome', { timeout: 4000 }).then(() => true).catch(() => false);
+      if (abriuFormulario) {
+        return true;
+      }
+
+      console.log(`[${nomeCurto}] ⚠️ Sem resposta clara da API na tentativa ${tentativa}/${maxTentativas}; tentando novamente.`);
+      await refreshCaptcha(page);
+      await esperar(700);
+      continue;
+    }
+
+    const status = responseVagas.status();
+    if (status === 400) {
+      console.log(`[${nomeCurto}] ⚠️ ERRO 400 em /api/vagas na tentativa ${tentativa}/${maxTentativas}. Recarregando captcha e trocando horário...`);
+      await refreshCaptcha(page);
+      await esperar(800);
+      continue;
+    }
+
+    if (status >= 200 && status < 300) {
+      const abriuFormulario = await page.waitForSelector('input#nome', { timeout: 7000 }).then(() => true).catch(() => false);
+      if (abriuFormulario) {
+        return true;
+      }
+    }
+
+    console.log(`[${nomeCurto}] ⚠️ API retornou status ${status} na tentativa ${tentativa}/${maxTentativas}; nova tentativa em seguida.`);
+    await refreshCaptcha(page);
+    await esperar(800);
+  }
+
+  return false;
+}
 
 // ==========================================
 // FUNÇÃO PARA RODAR O AGENDAMENTO PARA UMA PESSOA
@@ -30,7 +193,7 @@ async function agendarParaPessoa(dados) {
     while (!found) {
       try {
         await page.goto(URL, { waitUntil: 'domcontentloaded' });
-        await new Promise(r => setTimeout(r, 600));
+        await esperar(600);
 
         const clicoUnidade = await page.evaluate((localidadeFiltro) => {
           const elementsInfo = Array.from(document.querySelectorAll('p'));
@@ -65,83 +228,28 @@ async function agendarParaPessoa(dados) {
           break;
         } else {
           console.log(`[${nomeCurto}] ⏳ Buscando vagas${LOCALIDADE_ALVO ? ' em ' + LOCALIDADE_ALVO : ''}...`);
-          await new Promise(r => setTimeout(r, 1000));
+          await esperar(1000);
         }
       } catch (e) {
-         await new Promise(r => setTimeout(r, 1000));
+         await esperar(1000);
       }
     }
 
     if (found) {
-       await new Promise(r => setTimeout(r, 1500)); 
+       await esperar(1500);
 
-       // Seleciona Dia
-       await page.evaluate(() => {
-          const dias = Array.from(document.querySelectorAll('button.MuiPickersDay-root:not(.Mui-disabled), .react-datepicker__day:not(.react-datepicker__day--disabled), td:not(.disabled)'));
-          const diasValidos = dias.filter(d => {
-              const parse = parseInt(d.innerText.trim());
-              return !isNaN(parse) && parse > 0 && parse <= 31;
-          });
-          if(diasValidos.length > 0) diasValidos[0].click();
-       });
+       console.log(`[${nomeCurto}] 🤖 Selecionando dia/horário e enviando captcha com proteção contra erro 400...`);
+       await esperar(800);
 
-       await new Promise(r => setTimeout(r, 800)); 
-       
-       // Seleciona Horário
-       await page.evaluate(() => {
-           const horarios = Array.from(document.querySelectorAll('button:not([disabled]), li:not(.disabled)'))
-              .filter(el => el.innerText.includes(':') && /\d{2}:\d{2}/.test(el.innerText));
-           if(horarios.length > 0) horarios[0].click();
-       });
-
-       console.log(`[${nomeCurto}] 🤖 Resolvendo Captcha...`);
-       await new Promise(r => setTimeout(r, 1200));
-
-       // Listener para capturar erros da API do ITEP
-       page.on('response', response => {
-         if (response.url().includes('/api/vagas') && response.status() === 400) {
-           console.log(`[${nomeCurto}] ⚠️ ERRO 400: O servidor recusou o captcha ou a vaga já foi preenchida por outro!`);
-         }
-       });
-
-       const canvasDataUrl = await page.evaluate(() => {
-           const canvas = document.querySelector('canvas');
-           return canvas ? canvas.toDataURL() : null;
-       });
-
-       if (canvasDataUrl) {
-           const base64Data = canvasDataUrl.replace(/^data:image\/png;base64,/, "");
-           const buffer = Buffer.from(base64Data, 'base64');
-           const { data: { text } } = await Tesseract.recognize(buffer, 'eng');
-           const numbersOnly = text.replace(/[^0-9]/g, '');
-
-           if (numbersOnly.length > 0) {
-               console.log(`[${nomeCurto}] 🧠 Captcha identificado: ${numbersOnly}`);
-               const inputCaptcha = await page.$('input[type="number"]');
-               if (inputCaptcha) {
-                   await inputCaptcha.click(); // Garante o foco
-                   await new Promise(r => setTimeout(r, 200));
-                   await inputCaptcha.type(numbersOnly, { delay: 60 }); // Digitação humana
-                   await new Promise(r => setTimeout(r, 600));
-
-                   // Clique mais robusto via Puppeteer em vez de evaluate
-                   const buttons = await page.$$('button');
-                   for (const btn of buttons) {
-                       const txt = await page.evaluate(el => el.innerText.toLowerCase(), btn);
-                       if (txt.includes('prosseguir') || txt.includes('avançar')) {
-                           await btn.click();
-                           console.log(`[${nomeCurto}] 🖱️ Clique em prosseguir efetuado.`);
-                           break;
-                       }
-                   }
-               }
-           }
+      const conseguiuAvancar = await submeterComRetry(page, nomeCurto, MAX_TENTATIVAS_VAGAS);
+       if (!conseguiuAvancar) {
+         throw new Error('Não foi possível avançar após múltiplas tentativas de seleção de vaga/captcha.');
        }
        
        // Espera tela de preenchimento
        await page.waitForSelector('input#nome', { timeout: 0 }); 
        console.log(`[${nomeCurto}] ⚡ Preenchendo formulário...`);
-       await new Promise(r => setTimeout(r, 600));
+       await esperar(600);
 
        await page.type('input#nome', dados.nome, {delay: 5});
        await page.type('input#nome_mae', dados.mae, {delay: 5});
@@ -177,7 +285,7 @@ async function agendarParaPessoa(dados) {
        );
 
        console.log(`[${nomeCurto}] 🎉 AGENDAMENTO CONCLUÍDO! Gerando PDF do comprovante...`);
-       await new Promise(r => setTimeout(r, 2000)); 
+      await esperar(2000);
 
        // Emula mídia de impressão para o PDF sair limpo
        await page.emulateMediaType('print');

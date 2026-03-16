@@ -23,7 +23,10 @@ Este projeto automatiza o agendamento de emissão de RG no site do ITEP-RN. Ele 
    Configure a localidade preferida:
    ```env
    LOCALIDADE="NATAL"
+   MAX_TENTATIVAS_VAGAS=8
    ```
+
+   - `MAX_TENTATIVAS_VAGAS`: quantidade de tentativas automáticas para recuperar erro 400 na etapa de seleção de dia/horário + captcha.
 
 3. **Arquivo `pessoas.json`:**
    Adicione os dados das pessoas que deseja agendar seguindo o formato:
